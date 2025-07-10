@@ -11,7 +11,7 @@ scikit-learn==1.4.0
 
 # NLP & Text Processing
 textblob==0.17.1
-nltk==3.8.1
+nltk==3.9
 
 # Utilities
 python-dateutil==2.8.2
