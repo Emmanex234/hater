@@ -1,7 +1,7 @@
 # config.py
 import os
-from dataclasses import dataclass
-from typing import List, Dict, Any
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
 
 @dataclass
 class DatasetConfig:
@@ -10,21 +10,37 @@ class DatasetConfig:
     kaggle_id: str
     primary: bool = False
     max_samples: int = 5000
-    text_columns: List[str] = None
-    label_columns: List[str] = None
-    preprocessing_rules: Dict[str, Any] = None
+    text_columns: Optional[List[str]] = field(default_factory=lambda: None)
+    label_columns: Optional[List[str]] = field(default_factory=lambda: None)
+    preprocessing_rules: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 class Config:
     """Main configuration class for the hate speech detector"""
     
     def __init__(self):
-        self.environment = os.environ.get('ENVIRONMENT', 'render_free')
+        self.environment = os.environ.get('ENVIRONMENT', 'development')
+        self._validate_environment()
         self.setup_environment_config()
         self.setup_dataset_config()
         self.setup_model_config()
         self.setup_api_config()
     
-    def setup_environment_config(self):
+    def _validate_environment(self) -> None:
+        """Validate environment setting"""
+        valid_environments = ['production', 'render_free', 'development']
+        if self.environment not in valid_environments:
+            raise ValueError(f"Invalid environment: {self.environment}. Must be one of: {valid_environments}")
+    
+    def _parse_memory_limit(self, memory_str: str) -> int:
+        """Parse memory limit string to MB"""
+        if memory_str.endswith('GB'):
+            return int(memory_str.replace('GB', '')) * 1024
+        elif memory_str.endswith('MB'):
+            return int(memory_str.replace('MB', ''))
+        else:
+            raise ValueError(f"Invalid memory format: {memory_str}")
+    
+    def setup_environment_config(self) -> None:
         """Configure settings based on environment"""
         if self.environment == 'production':
             self.memory_limit = '2GB'
@@ -47,7 +63,7 @@ class Config:
             self.enable_monitoring = True
             self.log_level = 'DEBUG'
     
-    def setup_dataset_config(self):
+    def setup_dataset_config(self) -> None:
         """Configure datasets based on environment"""
         base_datasets = [
             DatasetConfig(
@@ -114,7 +130,7 @@ class Config:
         else:
             self.datasets = base_datasets
     
-    def setup_model_config(self):
+    def setup_model_config(self) -> None:
         """Configure model parameters based on environment"""
         if self.environment == 'production':
             self.model_config = {
@@ -164,7 +180,7 @@ class Config:
                 'feature_selection': True
             }
     
-    def setup_api_config(self):
+    def setup_api_config(self) -> None:
         """Configure API settings based on environment"""
         base_api_config = {
             'host': '0.0.0.0',
@@ -177,7 +193,7 @@ class Config:
             'cache_predictions': True,
             'cache_ttl': 3600,  # 1 hour
             'enable_logging': True,
-            'log_predictions': self.environment != 'production'
+            'log_predictions': self.environment == 'development'  # Only in dev
         }
         
         if self.environment == 'production':
@@ -207,7 +223,8 @@ class Config:
                 'ssl_enabled': False,
                 'max_text_length': 500,
                 'cache_ttl': 1800,  # 30 minutes
-                'monitoring_endpoint': '/status'
+                'monitoring_endpoint': '/status',
+                'log_predictions': False  # Don't log in render_free
             }
             
         else:  # development
@@ -224,18 +241,26 @@ class Config:
                 'test_endpoint': '/test'
             }
     
-    def get_kaggle_credentials(self):
+    def get_kaggle_credentials(self) -> Dict[str, str]:
         """Get Kaggle API credentials from environment variables"""
-        return {
-            'username': os.environ.get('KAGGLE_USERNAME'),
-            'key': os.environ.get('KAGGLE_KEY')
-        }
+        username = os.environ.get('KAGGLE_USERNAME')
+        key = os.environ.get('KAGGLE_KEY')
+        
+        if not username or not key:
+            raise ValueError("Kaggle credentials not found in environment variables. "
+                           "Please set KAGGLE_USERNAME and KAGGLE_KEY.")
+        
+        return {'username': username, 'key': key}
     
-    def get_database_config(self):
+    def get_database_config(self) -> Dict[str, Any]:
         """Get database configuration based on environment"""
         if self.environment == 'production':
+            db_url = os.environ.get('DATABASE_URL')
+            if not db_url:
+                raise ValueError("DATABASE_URL environment variable is required for production")
+            
             return {
-                'url': os.environ.get('DATABASE_URL'),
+                'url': db_url,
                 'pool_size': 10,
                 'max_overflow': 20,
                 'pool_timeout': 30,
@@ -259,7 +284,7 @@ class Config:
                 'echo': True  # SQL logging for development
             }
     
-    def validate_config(self):
+    def validate_config(self) -> bool:
         """Validate configuration settings"""
         required_vars = []
         
@@ -267,6 +292,7 @@ class Config:
             required_vars = ['DATABASE_URL', 'KAGGLE_USERNAME', 'KAGGLE_KEY']
         elif self.environment == 'render_free':
             required_vars = ['KAGGLE_USERNAME', 'KAGGLE_KEY']
+        # Development environment doesn't require external credentials
         
         missing_vars = [var for var in required_vars if not os.environ.get(var)]
         
@@ -274,17 +300,54 @@ class Config:
             raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
         
         # Validate memory limits
-        memory_mb = int(self.memory_limit.replace('MB', '').replace('GB', '')) * (1024 if 'GB' in self.memory_limit else 1)
-        if memory_mb < 256:
-            raise ValueError(f"Memory limit too low: {self.memory_limit}")
+        try:
+            memory_mb = self._parse_memory_limit(self.memory_limit)
+            if memory_mb < 256:
+                raise ValueError(f"Memory limit too low: {self.memory_limit}")
+        except ValueError as e:
+            raise ValueError(f"Invalid memory limit configuration: {e}")
+        
+        # Validate model config
+        if not self.model_config.get('ensemble_models'):
+            raise ValueError("At least one ensemble model must be specified")
+        
+        ensemble_weights = self.model_config.get('ensemble_weights', [])
+        ensemble_models = self.model_config.get('ensemble_models', [])
+        
+        if len(ensemble_weights) != len(ensemble_models):
+            raise ValueError("Number of ensemble weights must match number of ensemble models")
+        
+        if abs(sum(ensemble_weights) - 1.0) > 0.001:
+            raise ValueError("Ensemble weights must sum to 1.0")
         
         return True
 
-# Create global config instance
-config = Config()
 
-# Validate configuration on import
-try:
-    config.validate_config()
-except ValueError as e:
-    print(f"Configuration warning: {e}")
+# Global config instance management
+_config: Optional[Config] = None
+
+def get_config() -> Config:
+    """Get or create the global configuration instance"""
+    global _config
+    if _config is None:
+        _config = Config()
+        try:
+            _config.validate_config()
+        except ValueError as e:
+            print(f"Configuration warning: {e}")
+    return _config
+
+def reset_config() -> None:
+    """Reset the global configuration instance (useful for testing)"""
+    global _config
+    _config = None
+
+# Convenience function for backward compatibility
+def create_config() -> Config:
+    """Create a new configuration instance without caching"""
+    return Config()
+
+
+# For backward compatibility, you can still use:
+# config = get_config()
+# But it's better to call get_config() when you need it
